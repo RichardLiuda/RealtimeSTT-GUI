@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QTextEdit, QComboBox, QLabel,
                              QCheckBox, QHBoxLayout, QFrame, QDialog,
                              QTabWidget, QSpinBox, QDoubleSpinBox, QGridLayout,
-                             QGroupBox)
+                             QGroupBox, QLineEdit)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor
 from RealtimeSTT import AudioToTextRecorder
@@ -20,8 +20,8 @@ if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
 # 百度翻译 API 配置
-BAIDU_APPID = "20241206002221379"  # 替换为你的百度翻译 API ID
-BAIDU_KEY = "p0Fns03NOhQ7PLSL3QBc"  # 替换为你的百度翻译密钥
+BAIDU_APPID = ""  # 替换为你的百度翻译 API ID
+BAIDU_KEY = ""  # 替换为你的百度翻译密钥
 BAIDU_API_URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
 
 
@@ -238,6 +238,10 @@ class ConfigDialog(QDialog):
         perf_tab = self.create_perf_tab()
         tabs.addTab(perf_tab, "性能设置")
 
+        # 翻译设置
+        trans_tab = self.create_trans_tab()
+        tabs.addTab(trans_tab, "翻译设置")
+
         layout.addWidget(tabs)
 
         # 按钮
@@ -320,6 +324,54 @@ class ConfigDialog(QDialog):
         grid.addWidget(QLabel("计算精度:"), 3, 0)
         grid.addWidget(self.compute_type_combo, 3, 1)
 
+        # 当设备切换时自动调整精度
+        def on_device_changed(device):
+            if device == "cpu":
+                self.compute_type_combo.setCurrentText("float32")
+                self.compute_type_combo.setEnabled(False)
+            else:
+                self.compute_type_combo.setEnabled(True)
+
+        self.device_combo.currentTextChanged.connect(on_device_changed)
+        # 初始化时检查一次
+        on_device_changed(self.device_combo.currentText())
+
+        group.setLayout(grid)
+        layout.addWidget(group)
+        tab.setLayout(layout)
+        return tab
+
+    def create_trans_tab(self):
+        tab = QWidget()
+        layout = QGridLayout()
+        group = QGroupBox("翻译参数")
+        grid = QGridLayout()
+
+        # 启用翻译
+        self.enable_trans = QCheckBox("启用翻译")
+        self.enable_trans.setChecked(True)
+        grid.addWidget(self.enable_trans, 0, 0, 1, 2)
+
+        # 百度翻译 API ID
+        self.baidu_appid = QLineEdit()
+        self.baidu_appid.setPlaceholderText("请输入百度翻译 API ID")
+        grid.addWidget(QLabel("API ID:"), 1, 0)
+        grid.addWidget(self.baidu_appid, 1, 1)
+
+        # 百度翻译密钥
+        self.baidu_key = QLineEdit()
+        self.baidu_key.setPlaceholderText("请输入百度翻译密钥")
+        self.baidu_key.setEchoMode(QLineEdit.Password)
+        grid.addWidget(QLabel("密钥:"), 2, 0)
+        grid.addWidget(self.baidu_key, 2, 1)
+
+        # 目标语言
+        self.target_lang = QComboBox()
+        self.target_lang.addItems(
+            ["中文", "英语", "日语", "韩语", "俄语", "德语", "法语", "西班牙语"])
+        grid.addWidget(QLabel("目标语言:"), 3, 0)
+        grid.addWidget(self.target_lang, 3, 1)
+
         group.setLayout(grid)
         layout.addWidget(group)
         tab.setLayout(layout)
@@ -333,7 +385,11 @@ class ConfigDialog(QDialog):
             'beam_size': self.beam_size.value(),
             'realtime_processing_pause': self.processing_pause.value(),
             'device': self.device_combo.currentText(),
-            'compute_type': self.compute_type_combo.currentText()
+            'compute_type': self.compute_type_combo.currentText(),
+            'enable_translation': self.enable_trans.isChecked(),
+            'baidu_appid': self.baidu_appid.text(),
+            'baidu_key': self.baidu_key.text(),
+            'target_language': self.target_lang.currentText()
         }
 
 
@@ -354,14 +410,23 @@ class MainWindow(QMainWindow):
         self.setup_signals()
 
     def init_config(self):
+        # 检测系统是否支持 CUDA
+        import torch
+        default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        default_compute_type = 'float16' if default_device == 'cuda' else 'float32'
+
         self.config = {
             'silero_sensitivity': 0.7,
             'post_speech_silence_duration': 0.5,
             'min_length_of_recording': 0.5,
             'beam_size': 3,
             'realtime_processing_pause': 0.2,
-            'device': 'cuda',
-            'compute_type': 'float16'
+            'device': default_device,
+            'compute_type': default_compute_type,
+            'enable_translation': True,
+            'baidu_appid': BAIDU_APPID,
+            'baidu_key': BAIDU_KEY,
+            'target_language': '中文'
         }
         self.transcription_thread = None
 
@@ -645,7 +710,9 @@ class MainWindow(QMainWindow):
 
                 # 获取翻译
                 translated_text = None
-                if self.language_combo.currentText() != "中文 (Chinese)":
+                if self.config[
+                        'enable_translation'] and self.language_combo.currentText(
+                        ) != "中文 (Chinese)":
                     from_lang = {
                         "英语 (English)": "en",
                         "日语 (Japanese)": "jp",
@@ -656,9 +723,21 @@ class MainWindow(QMainWindow):
                         "西班牙语 (Spanish)": "spa",
                         "自动检测": "auto"
                     }.get(self.language_combo.currentText(), "auto")
+
+                    to_lang = {
+                        "中文": "zh",
+                        "英语": "en",
+                        "日语": "jp",
+                        "韩语": "kor",
+                        "俄语": "ru",
+                        "德语": "de",
+                        "法语": "fra",
+                        "西班牙语": "spa"
+                    }.get(self.config['target_language'], "zh")
+
                     translated_text = translate_text(text,
                                                      from_lang=from_lang,
-                                                     to_lang='zh')
+                                                     to_lang=to_lang)
 
                 # 写入日志文件，添加缩进和引用格式
                 with open(self.log_file, "a", encoding="utf-8") as f:
@@ -681,9 +760,24 @@ class MainWindow(QMainWindow):
             self.config['realtime_processing_pause'])
         dialog.device_combo.setCurrentText(self.config['device'])
         dialog.compute_type_combo.setCurrentText(self.config['compute_type'])
+        dialog.enable_trans.setChecked(self.config['enable_translation'])
+        dialog.baidu_appid.setText(self.config['baidu_appid'])
+        dialog.baidu_key.setText(self.config['baidu_key'])
+        dialog.target_lang.setCurrentText(self.config['target_language'])
 
         if dialog.exec_() == QDialog.Accepted:
-            self.config.update(dialog.get_config())
+            new_config = dialog.get_config()
+
+            # 确保 CPU 设备使用 float32 精度
+            if new_config['device'] == 'cpu' and new_config[
+                    'compute_type'] != 'float32':
+                new_config['compute_type'] = 'float32'
+
+            self.config.update(new_config)
+            # 更新全局翻译配置
+            global BAIDU_APPID, BAIDU_KEY
+            BAIDU_APPID = self.config['baidu_appid']
+            BAIDU_KEY = self.config['baidu_key']
 
 
 if __name__ == '__main__':
