@@ -1,5 +1,9 @@
 import sys
 import os
+import json
+import hashlib
+import random
+import requests
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QTextEdit, QComboBox, QLabel,
@@ -14,6 +18,40 @@ from RealtimeSTT import AudioToTextRecorder
 LOG_DIR = "logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
+
+# 百度翻译 API 配置
+BAIDU_APPID = "20241206002221379"  # 替换为你的百度翻译 API ID
+BAIDU_KEY = "p0Fns03NOhQ7PLSL3QBc"  # 替换为你的百度翻译密钥
+BAIDU_API_URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+
+
+def translate_text(text, from_lang='en', to_lang='zh'):
+    """使用百度翻译 API 翻译文本"""
+    try:
+        salt = str(random.randint(32768, 65536))
+        sign = hashlib.md5(
+            (BAIDU_APPID + text + salt + BAIDU_KEY).encode()).hexdigest()
+
+        params = {
+            'appid': BAIDU_APPID,
+            'q': text,
+            'from': from_lang,
+            'to': to_lang,
+            'salt': salt,
+            'sign': sign
+        }
+
+        response = requests.get(BAIDU_API_URL, params=params)
+        result = response.json()
+
+        if 'trans_result' in result:
+            return result['trans_result'][0]['dst']
+        else:
+            print(f"翻译错误: {result.get('error_msg', '未知错误')}")
+            return None
+    except Exception as e:
+        print(f"翻译请求失败: {e}")
+        return None
 
 
 class TranscriptionThread(QThread):
@@ -342,7 +380,8 @@ class MainWindow(QMainWindow):
                 f.write(f"- 🤖 **模型**：`{self.model_combo.currentText()}`\n")
                 f.write(f"- 🌐 **语言**：`{self.language_combo.currentText()}`\n")
                 f.write(f"- ⚡ **设备**：`{self.config['device']}`\n")
-                f.write(f"- 🎯 **精度**：`{self.config['compute_type']}`\n\n")
+                f.write(f"- 🎯 **精度**：`{self.config['compute_type']}`\n")
+                f.write(f"- 🔄 **翻译**：启用\n\n")
                 f.write("## ⚙️ 配置信息\n\n")
                 f.write("### 🎤 语音检测\n\n")
                 f.write(f"- 灵敏度：`{self.config['silero_sensitivity']}`\n")
@@ -604,9 +643,30 @@ class MainWindow(QMainWindow):
                 self.complete_text.verticalScrollBar().setValue(
                     self.complete_text.verticalScrollBar().maximum())
 
+                # 获取翻译
+                translated_text = None
+                if self.language_combo.currentText() != "中文 (Chinese)":
+                    from_lang = {
+                        "英语 (English)": "en",
+                        "日语 (Japanese)": "jp",
+                        "韩语 (Korean)": "kor",
+                        "俄语 (Russian)": "ru",
+                        "德语 (German)": "de",
+                        "法语 (French)": "fra",
+                        "西班牙语 (Spanish)": "spa",
+                        "自动检测": "auto"
+                    }.get(self.language_combo.currentText(), "auto")
+                    translated_text = translate_text(text,
+                                                     from_lang=from_lang,
+                                                     to_lang='zh')
+
                 # 写入日志文件，添加缩进和引用格式
                 with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(f"> {text}\n\n")
+                    f.write(f"> {text}\n")
+                    if translated_text:
+                        f.write(f"> 🔄 译文：{translated_text}\n")
+                    f.write("\n")
+
             except Exception as e:
                 print(f"更新完整文本失败: {e}")
 
