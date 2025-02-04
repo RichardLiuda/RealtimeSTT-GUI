@@ -10,6 +10,7 @@
 - 💻 GPU 加速支持
 - 📝 自动保存转写记录（Markdown 格式）
 - 🎯 用户友好的图形界面
+- 🈁 日语汉字注音功能（自动添加平假名注音）
 
 ## 🚀 快速开始
 
@@ -20,12 +21,13 @@ Python 3.8+
 PyQt5
 RealtimeSTT
 requests
+pykakasi  # 用于日语注音功能
 ```
 
 ### 安装依赖
 
 ```bash
-pip install PyQt5 RealtimeSTT requests
+pip install PyQt5 RealtimeSTT requests pykakasi
 ```
 
 ### 运行程序
@@ -53,6 +55,14 @@ python realtime_stt_gui.py
 - 自动生成带时间戳的转写记录
 - Markdown 格式便于阅读和分享
 - 支持实时翻译结果记录
+- 日语转写支持汉字注音（蓝色显示）
+- 所有记录保存在同一个文件中（transcript.md）
+
+### 日语注音功能
+- 自动为日语转写中的汉字添加平假名注音
+- 带注音的汉字以蓝色显示，提高可读性
+- 注音格式：漢字(かんじ)
+- 仅在选择日语语言时启用
 
 ## 🔑 功能配置
 
