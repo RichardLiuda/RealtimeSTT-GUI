@@ -4,20 +4,29 @@ import json
 import hashlib
 import random
 import requests
+import re
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QTextEdit, QComboBox, QLabel,
                              QCheckBox, QHBoxLayout, QFrame, QDialog,
                              QTabWidget, QSpinBox, QDoubleSpinBox, QGridLayout,
                              QGroupBox, QLineEdit)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QThreadPool, QRunnable
 from PyQt5.QtGui import QColor
 from RealtimeSTT import AudioToTextRecorder
 
-# 创建日志文件夹
+try:
+    from pykakasi import kakasi
+    KAKASI = kakasi()
+except ImportError:
+    print("请安装 pykakasi 库以支持日语注音功能：pip install pykakasi")
+    KAKASI = None
+
+# 创建日志文件夹和固定日志文件
 LOG_DIR = "logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
+LOG_FILE = os.path.join(LOG_DIR, "transcript.md")
 
 # 百度翻译 API 配置
 BAIDU_APPID = ""  # 替换为你的百度翻译 API ID
@@ -52,6 +61,33 @@ def translate_text(text, from_lang='en', to_lang='zh'):
     except Exception as e:
         print(f"翻译请求失败: {e}")
         return None
+
+
+def add_furigana(text):
+    """为日语文本中的汉字添加平假名注音，并用HTML格式添加颜色"""
+    if not KAKASI or not text:
+        return text
+
+    try:
+        # 使用 kakasi 转换
+        result = KAKASI.convert(text)
+
+        # 构建带注音和颜色的文本
+        annotated_text = ""
+        for item in result:
+            orig = item['orig']
+            hira = item['hira']
+
+            # 如果原文是汉字且有对应的平假名，添加带颜色的注音
+            if orig != hira and any('\u4e00' <= c <= '\u9fff' for c in orig):
+                annotated_text += f"<span style='color: #0066cc'>{orig}({hira})</span>"
+            else:
+                annotated_text += orig
+
+        return annotated_text
+    except Exception as e:
+        print(f"添加注音失败: {e}")
+        return text
 
 
 class TranscriptionThread(QThread):
@@ -393,13 +429,60 @@ class ConfigDialog(QDialog):
         }
 
 
+class LogWorker(QRunnable):
+    """异步日志写入工作器"""
+
+    def __init__(self, content, add_furigana_flag=False):
+        super().__init__()
+        self.content = content
+        self.add_furigana_flag = add_furigana_flag
+
+    def run(self):
+        try:
+            if self.add_furigana_flag:
+                # 仅为正文内容添加注音，不处理时间戳和其他格式标记
+                if self.content.startswith(">"):
+                    # 提取实际文本内容
+                    text_match = re.match(r"^>(.*?)(?:\n|$)", self.content)
+                    if text_match:
+                        text = text_match.group(1).strip()
+                        annotated_text = add_furigana(text)
+                        self.content = f"> {annotated_text}\n"
+
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(self.content)
+        except Exception as e:
+            print(f"写入日志失败: {e}")
+
+
+class TranslationWorker(QRunnable):
+    """异步翻译工作器"""
+
+    def __init__(self, text, from_lang, to_lang, callback):
+        super().__init__()
+        self.text = text
+        self.from_lang = from_lang
+        self.to_lang = to_lang
+        self.callback = callback
+
+    def run(self):
+        try:
+            translated_text = translate_text(self.text, self.from_lang,
+                                             self.to_lang)
+            if translated_text:
+                self.callback(translated_text)
+        except Exception as e:
+            print(f"翻译失败: {e}")
+
+
 class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.thread_pool = QThreadPool()
         self.init_ui()
         self.init_log_file()
-        self.current_realtime_text = ""  # 用于临时存储实时转写文本
+        self.current_realtime_text = ""
 
     def init_ui(self):
         self.setWindowTitle("实时语音转文字")
@@ -413,16 +496,15 @@ class MainWindow(QMainWindow):
         # 检测系统是否支持 CUDA
         import torch
         default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        default_compute_type = 'float16' if default_device == 'cuda' else 'float32'
 
         self.config = {
-            'silero_sensitivity': 0.7,
-            'post_speech_silence_duration': 0.5,
+            'silero_sensitivity': 0.8,  # 默认灵敏度调整为 0.8
+            'post_speech_silence_duration': 0.8,  # 默认静音检测调整为 0.8s
             'min_length_of_recording': 0.5,
             'beam_size': 3,
             'realtime_processing_pause': 0.2,
             'device': default_device,
-            'compute_type': default_compute_type,
+            'compute_type': 'float32',  # 默认使用 float32
             'enable_translation': True,
             'baidu_appid': BAIDU_APPID,
             'baidu_key': BAIDU_KEY,
@@ -432,37 +514,29 @@ class MainWindow(QMainWindow):
 
     def init_log_file(self):
         try:
-            # 创建新的日志文件
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.log_file = os.path.join(LOG_DIR, f"transcript_{timestamp}.md")
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # 如果日志文件不存在，创建新的日志文件
+            if not os.path.exists(LOG_FILE):
+                with open(LOG_FILE, "w", encoding="utf-8") as f:
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    f.write("# 🎙️ 语音转写记录\n\n")
+                    f.write(f"## 📝 会话信息\n\n")
+                    f.write(f"- 📅 **开始时间**：{current_time}\n")
+                    f.write("## 📄 转写内容\n\n")
 
-            # 写入日志文件头部
-            with open(self.log_file, "w", encoding="utf-8") as f:
-                f.write("# 🎙️ 语音转写记录\n\n")
-                f.write("## 📝 会话信息\n\n")
-                f.write(f"- 📅 **时间**：{current_time}\n")
+            # 添加新的会话分隔线
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"\n### 🆕 新会话 `{current_time}`\n\n")
                 f.write(f"- 🤖 **模型**：`{self.model_combo.currentText()}`\n")
                 f.write(f"- 🌐 **语言**：`{self.language_combo.currentText()}`\n")
                 f.write(f"- ⚡ **设备**：`{self.config['device']}`\n")
                 f.write(f"- 🎯 **精度**：`{self.config['compute_type']}`\n")
-                f.write(f"- 🔄 **翻译**：启用\n\n")
-                f.write("## ⚙️ 配置信息\n\n")
-                f.write("### 🎤 语音检测\n\n")
-                f.write(f"- 灵敏度：`{self.config['silero_sensitivity']}`\n")
                 f.write(
-                    f"- 静音检测：`{self.config['post_speech_silence_duration']}秒`\n"
+                    f"- 🔄 **翻译**：{'启用' if self.config['enable_translation'] else '禁用'}\n\n"
                 )
-                f.write(
-                    f"- 最小录音：`{self.config['min_length_of_recording']}秒`\n\n")
-                f.write("### 🚀 性能参数\n\n")
-                f.write(f"- Beam Size：`{self.config['beam_size']}`\n")
-                f.write(
-                    f"- 处理间隔：`{self.config['realtime_processing_pause']}秒`\n\n"
-                )
-                f.write("## 📄 转写内容\n\n")
+
         except Exception as e:
-            print(f"创建日志文件失败: {e}")
+            print(f"初始化日志文件失败: {e}")
 
     def setup_style(self):
         self.setStyleSheet("""
@@ -621,15 +695,23 @@ class MainWindow(QMainWindow):
 
     def start_recording(self):
         try:
-            # 清空当前实时转写文本
             self.current_realtime_text = ""
 
-            # 记录开始新的录音会话
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                current_time = datetime.now().strftime("%H:%M:%S")
-                f.write(f"\n### 🎬 录音开始 `{current_time}`\n\n")
+            # 异步记录开始新的录音会话
+            current_time = datetime.now().strftime("%H:%M:%S")
+            log_content = (
+                f"\n### 🎬 录音开始 `{current_time}`\n\n"
+                "当前会话配置：\n"
+                f"- 🤖 **模型**：`{self.model_combo.currentText()}`\n"
+                f"- 🌐 **语言**：`{self.language_combo.currentText()}`\n"
+                f"- ⚡ **设备**：`{self.config['device']}`\n"
+                f"- 🎯 **精度**：`{self.config['compute_type']}`\n"
+                f"- 🎤 **灵敏度**：`{self.config['silero_sensitivity']}`\n"
+                f"- ⏱️ **静音检测**：`{self.config['post_speech_silence_duration']}秒`\n\n"
+            )
+            self.async_log(log_content)
         except Exception as e:
-            print(f"写入日志失败: {e}")
+            print(f"准备录音日志失败: {e}")
 
         self.record_button.setText("停止录音")
         self.record_button.setStyleSheet(
@@ -660,17 +742,18 @@ class MainWindow(QMainWindow):
 
     def on_recording_finished(self):
         try:
-            if self.current_realtime_text:  # 如果有未完成的实时转写，记录最后的结果
-                with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(f"> {self.current_realtime_text}\n\n")
+            if self.current_realtime_text:
+                # 异步记录最后的实时转写结果
+                self.async_log(f"> {self.current_realtime_text}\n\n")
 
-            # 添加结束标记和统计信息
-            with open(self.log_file, "a", encoding="utf-8") as f:
-                current_time = datetime.now().strftime("%H:%M:%S")
-                f.write(f"\n### 🏁 录音结束 `{current_time}`\n\n")
-                f.write("---\n\n")
+            # 异步添加结束标记和统计信息
+            current_time = datetime.now().strftime("%H:%M:%S")
+            log_content = (f"\n### 🏁 录音结束 `{current_time}`\n\n"
+                           "会话统计：\n"
+                           f"- ⏱️ **结束时间**：`{current_time}`\n"
+                           "---\n\n")
+            self.async_log(log_content)
 
-            # 清空当前实时转写文本
             self.current_realtime_text = ""
         except Exception as e:
             print(f"写入会话结束信息失败: {e}")
@@ -708,8 +791,11 @@ class MainWindow(QMainWindow):
                 self.complete_text.verticalScrollBar().setValue(
                     self.complete_text.verticalScrollBar().maximum())
 
-                # 获取翻译
-                translated_text = None
+                # 异步写入日志（对日语文本添加注音）
+                log_content = f"> {text}\n"
+                self.async_log(log_content, add_furigana=True)
+
+                # 如果需要翻译，异步执行翻译
                 if self.config[
                         'enable_translation'] and self.language_combo.currentText(
                         ) != "中文 (Chinese)":
@@ -735,22 +821,24 @@ class MainWindow(QMainWindow):
                         "西班牙语": "spa"
                     }.get(self.config['target_language'], "zh")
 
-                    translated_text = translate_text(text,
-                                                     from_lang=from_lang,
-                                                     to_lang=to_lang)
+                    def on_translation_complete(translated_text):
+                        # 异步写入翻译结果
+                        translation_content = f"> 🔄 译文：{translated_text}\n\n"
+                        self.async_log(translation_content)
 
-                # 写入日志文件，添加缩进和引用格式
-                with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(f"> {text}\n")
-                    if translated_text:
-                        f.write(f"> 🔄 译文：{translated_text}\n")
-                    f.write("\n")
+                    worker = TranslationWorker(text, from_lang, to_lang,
+                                               on_translation_complete)
+                    self.thread_pool.start(worker)
+                else:
+                    # 如果不需要翻译，直接添加换行
+                    self.async_log("\n")
 
             except Exception as e:
                 print(f"更新完整文本失败: {e}")
 
     def show_config_dialog(self):
         dialog = ConfigDialog(self)
+        # 加载当前配置到对话框
         dialog.silero_sensitivity.setValue(self.config['silero_sensitivity'])
         dialog.silence_duration.setValue(
             self.config['post_speech_silence_duration'])
@@ -773,11 +861,47 @@ class MainWindow(QMainWindow):
                     'compute_type'] != 'float32':
                 new_config['compute_type'] = 'float32'
 
+            # 记录配置变更
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    current_time = datetime.now().strftime("%H:%M:%S")
+                    f.write(f"\n### ⚙️ 配置更新 `{current_time}`\n\n")
+
+                    # 检查并记录变更的配置项
+                    changes = []
+                    for key, new_value in new_config.items():
+                        old_value = self.config.get(key)
+                        if new_value != old_value:
+                            if key in ['baidu_appid', 'baidu_key']:
+                                changes.append(f"- {key}: `[已修改]`")
+                            else:
+                                changes.append(
+                                    f"- {key}: `{old_value}` → `{new_value}`")
+
+                    if changes:
+                        f.write("变更项：\n")
+                        f.write("\n".join(changes))
+                        f.write("\n\n---\n\n")
+                    else:
+                        f.write("配置未发生变更\n\n---\n\n")
+            except Exception as e:
+                print(f"写入配置更新日志失败: {e}")
+
+            # 更新配置
             self.config.update(new_config)
             # 更新全局翻译配置
             global BAIDU_APPID, BAIDU_KEY
             BAIDU_APPID = self.config['baidu_appid']
             BAIDU_KEY = self.config['baidu_key']
+
+    def async_log(self, content, add_furigana=False):
+        """异步写入日志"""
+        # 仅当选择日语且内容是实际转写文本时添加注音
+        should_add_furigana = (add_furigana
+                               and self.language_combo.currentText()
+                               == "日语 (Japanese)" and content.startswith(">"))
+        worker = LogWorker(content, should_add_furigana)
+        self.thread_pool.start(worker)
 
 
 if __name__ == '__main__':
