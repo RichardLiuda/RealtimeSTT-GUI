@@ -29,8 +29,8 @@ if not os.path.exists(LOG_DIR):
 LOG_FILE = os.path.join(LOG_DIR, "transcript.md")
 
 # 百度翻译 API 配置
-BAIDU_APPID = ""  # 替换为你的百度翻译 API ID
-BAIDU_KEY = ""  # 替换为你的百度翻译密钥
+BAIDU_APPID = "20241206002221379"  # 替换为你的百度翻译 API ID
+BAIDU_KEY = "p0Fns03NOhQ7PLSL3QBc"  # 替换为你的百度翻译密钥
 BAIDU_API_URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
 
 
@@ -94,6 +94,7 @@ class TranscriptionThread(QThread):
     text_signal = pyqtSignal(str)
     realtime_signal = pyqtSignal(str)
     finished_signal = pyqtSignal()
+    status_signal = pyqtSignal(str)  # 新增状态信号
 
     def __init__(self, model="tiny", enable_realtime=True):
         super().__init__()
@@ -141,6 +142,10 @@ class TranscriptionThread(QThread):
                 config['realtime_processing_pause'],
                 device=self.config['device'],
                 compute_type=self.config['compute_type'])
+
+            # 设置音频缓冲区大小限制
+            self.recorder.audio_queue_size_limit = 100  # 限制音频队列大小
+
         except Exception as e:
             print(f"录音器初始化错误: {e}")
             self.is_recording = False
@@ -149,17 +154,53 @@ class TranscriptionThread(QThread):
         if self.is_recording and text:
             self.realtime_signal.emit(text)
 
+    def check_status(self):
+        """检查录音器状态"""
+        if not self.recorder:
+            return "⚠️ 未初始化"
+
+        try:
+            # 检查录音器的内部状态
+            if not self.is_recording:
+                return "⏹️ 已停止"
+
+            if hasattr(self.recorder, '_audio_recorder'):
+                recorder = self.recorder._audio_recorder
+                if hasattr(recorder, '_recording') and recorder._recording:
+                    return "🎙️ 正在录音..."
+                elif hasattr(
+                        recorder,
+                        '_processing_audio') and recorder._processing_audio:
+                    return "⚙️ 正在转录..."
+                elif hasattr(recorder, '_listening') and recorder._listening:
+                    return "🗣️ 请说话..."
+
+            return "👂 正在监听..."
+        except Exception as e:
+            print(f"状态检查错误: {e}")
+            return "⚠️ 状态未知"
+
     def run(self):
         try:
             self.setup_recorder()
+            self.status_signal.emit("👂 正在初始化...")
             while self.is_recording:
                 if self.recorder:
+                    # 更新状态
+                    current_status = self.check_status()
+                    self.status_signal.emit(current_status)
+
+                    # 获取转录文本
                     text = self.recorder.text()
                     if text:
                         self.text_signal.emit(text)
                 self.msleep(100)
+        except Exception as e:
+            print(f"录音线程运行错误: {e}")
+            self.status_signal.emit("❌ 发生错误")
         finally:
             self.cleanup()
+            self.status_signal.emit("⏹️ 已停止")
             self.finished_signal.emit()
 
     def cleanup(self):
@@ -171,51 +212,21 @@ class TranscriptionThread(QThread):
             print(f"清理录音器错误: {e}")
 
     def start_recording(self):
+        """开始录音"""
         self.is_recording = True
         self.start()
 
     def stop_recording(self):
+        """停止录音"""
         self.is_recording = False
-        self.cleanup()
-        self.wait(1000)
 
 
 class MaterialButton(QPushButton):
 
-    def __init__(self, text, color="#6750A4"):
+    def __init__(self, text, button_type="primary"):
         super().__init__(text)
-        self.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {color};
-                color: white;
-                border: none;
-                border-radius: 24px;
-                padding: 12px 32px;
-                font-size: 16px;
-                font-weight: 500;
-                min-width: 140px;
-                min-height: 48px;
-                margin: 8px;
-            }}
-            QPushButton:hover {{
-                background-color: {self.adjust_color(color, 1.1)};
-            }}
-            QPushButton:pressed {{
-                background-color: {self.adjust_color(color, 0.9)};
-            }}
-            QPushButton:disabled {{
-                background-color: #CAC4D0;
-                color: #1D1B20;
-            }}
-        """)
-
-    @staticmethod
-    def adjust_color(color, factor):
-        c = QColor(color)
-        h, s, v, a = c.getHsv()
-        v = min(255, int(v * factor))
-        c.setHsv(h, s, v, a)
-        return c.name()
+        self.setProperty("class", "material-button")
+        self.setProperty("type", button_type)
 
 
 class ConfigDialog(QDialog):
@@ -282,8 +293,8 @@ class ConfigDialog(QDialog):
 
         # 按钮
         button_layout = QHBoxLayout()
-        save_button = MaterialButton("保存", "#6750A4")
-        cancel_button = MaterialButton("取消", "#B4261E")
+        save_button = MaterialButton("保存", "primary")
+        cancel_button = MaterialButton("取消", "secondary")
 
         save_button.clicked.connect(self.accept)
         cancel_button.clicked.connect(self.reject)
@@ -488,7 +499,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("实时语音转文字")
         self.setMinimumSize(800, 600)
         self.init_config()
-        self.setup_style()
+
+        # 加载外部CSS文件
+        try:
+            with open("styles.css", "r", encoding="utf-8") as f:
+                self.setStyleSheet(f.read())
+        except Exception as e:
+            print(f"加载CSS文件失败: {e}")
+
         self.setup_layout()
         self.setup_signals()
 
@@ -538,52 +556,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"初始化日志文件失败: {e}")
 
-    def setup_style(self):
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #FFFBFE;
-            }
-            QLabel {
-                font-size: 16px;
-                color: #1D1B20;
-                margin: 8px 0;
-            }
-            QComboBox {
-                border: 2px solid #79747E;
-                border-radius: 12px;
-                padding: 8px 16px;
-                min-width: 200px;
-                font-size: 16px;
-                background-color: white;
-            }
-            QComboBox::drop-down {
-                border: none;
-                padding-right: 20px;
-            }
-            QTextEdit {
-                border: 2px solid #E7E0EC;
-                border-radius: 16px;
-                padding: 16px;
-                font-size: 16px;
-                line-height: 1.5;
-                background-color: white;
-            }
-            QCheckBox {
-                font-size: 16px;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 24px;
-                height: 24px;
-                border: 2px solid #79747E;
-                border-radius: 4px;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #6750A4;
-                border-color: #6750A4;
-            }
-        """)
-
     def setup_layout(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -601,16 +573,19 @@ class MainWindow(QMainWindow):
 
     def create_top_card(self):
         card = QFrame()
-        card.setStyleSheet("""
-            QFrame {
-                background-color: white;
-                border: 2px solid #E7E0EC;
-                border-radius: 16px;
-            }
-        """)
+        card.setProperty("class", "card")
         layout = QVBoxLayout(card)
         layout.setSpacing(16)
         layout.setContentsMargins(24, 24, 24, 24)
+
+        # 状态显示
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(QLabel("状态:"))
+        self.status_label = QLabel("准备就绪")
+        self.status_label.setObjectName("status_label")
+        status_layout.addWidget(self.status_label)
+        status_layout.addStretch()
+        layout.addLayout(status_layout)
 
         # 模型选择
         model_layout = QHBoxLayout()
@@ -636,15 +611,15 @@ class MainWindow(QMainWindow):
         language_layout.addStretch()
         layout.addLayout(language_layout)
 
-        # 实时转写选项（默认开启）
+        # 实时转写选项
         self.realtime_checkbox = QCheckBox("启用实时转写")
-        self.realtime_checkbox.setChecked(True)  # 默认选中
+        self.realtime_checkbox.setChecked(True)
         layout.addWidget(self.realtime_checkbox)
 
         # 按钮
         button_layout = QHBoxLayout()
-        self.record_button = MaterialButton("开始录音", "#6750A4")
-        self.config_button = MaterialButton("配置", "#79747E")
+        self.record_button = MaterialButton("开始录音", "primary")
+        self.config_button = MaterialButton("配置", "secondary")
         button_layout.addWidget(self.record_button)
         button_layout.addWidget(self.config_button)
         button_layout.addStretch()
@@ -654,13 +629,7 @@ class MainWindow(QMainWindow):
 
     def create_content_card(self):
         card = QFrame()
-        card.setStyleSheet("""
-            QFrame {
-                background-color: white;
-                border: 2px solid #E7E0EC;
-                border-radius: 16px;
-            }
-        """)
+        card.setProperty("class", "card")
         layout = QVBoxLayout(card)
         layout.setSpacing(16)
         layout.setContentsMargins(24, 24, 24, 24)
@@ -694,8 +663,11 @@ class MainWindow(QMainWindow):
             self.stop_recording()
 
     def start_recording(self):
+        """开始录音"""
         try:
             self.current_realtime_text = ""
+            self.status_label.setText("正在初始化...")
+            self.status_label.setProperty("status", "recording")
 
             # 异步记录开始新的录音会话
             current_time = datetime.now().strftime("%H:%M:%S")
@@ -710,35 +682,55 @@ class MainWindow(QMainWindow):
                 f"- ⏱️ **静音检测**：`{self.config['post_speech_silence_duration']}秒`\n\n"
             )
             self.async_log(log_content)
+
+            # 禁用控件
+            self.record_button.setText("停止录音")
+            self.record_button.setProperty("type", "secondary")
+            self.model_combo.setEnabled(False)
+            self.language_combo.setEnabled(False)
+            self.realtime_checkbox.setEnabled(False)
+            self.config_button.setEnabled(False)
+
+            # 创建并配置转录线程
+            self.transcription_thread = TranscriptionThread(
+                model=self.model_combo.currentText(),
+                enable_realtime=self.realtime_checkbox.isChecked())
+            self.transcription_thread.language = self.language_combo.currentText(
+            )
+            self.transcription_thread.config = self.config.copy()  # 使用配置的副本
+
+            # 连接信号
+            self.transcription_thread.text_signal.connect(
+                self.update_complete_text)
+            self.transcription_thread.realtime_signal.connect(
+                self.update_realtime_text)
+            self.transcription_thread.finished_signal.connect(
+                self.on_recording_finished)
+            self.transcription_thread.status_signal.connect(self.update_status)
+
+            # 启动线程
+            self.transcription_thread.is_recording = True
+            self.transcription_thread.start()
+
         except Exception as e:
-            print(f"准备录音日志失败: {e}")
-
-        self.record_button.setText("停止录音")
-        self.record_button.setStyleSheet(
-            self.record_button.styleSheet().replace("#6750A4", "#B3261E"))
-        self.model_combo.setEnabled(False)
-        self.language_combo.setEnabled(False)
-        self.realtime_checkbox.setEnabled(False)
-        self.config_button.setEnabled(False)
-
-        self.transcription_thread = TranscriptionThread(
-            model=self.model_combo.currentText(),
-            enable_realtime=self.realtime_checkbox.isChecked())
-        self.transcription_thread.language = self.language_combo.currentText()
-        self.transcription_thread.config = self.config
-        self.transcription_thread.text_signal.connect(
-            self.update_complete_text)
-        self.transcription_thread.realtime_signal.connect(
-            self.update_realtime_text)
-        self.transcription_thread.finished_signal.connect(
-            self.on_recording_finished)
-        self.transcription_thread.start_recording()
+            print(f"准备录音失败: {e}")
+            # 恢复界面状态
+            self.record_button.setText("开始录音")
+            self.record_button.setProperty("type", "primary")
+            self.model_combo.setEnabled(True)
+            self.language_combo.setEnabled(True)
+            self.realtime_checkbox.setEnabled(True)
+            self.config_button.setEnabled(True)
+            self.status_label.setText("准备就绪")
+            self.status_label.setProperty("status", "")
 
     def stop_recording(self):
+        """停止录音"""
         if self.transcription_thread and self.transcription_thread.is_recording:
-            self.transcription_thread.stop_recording()
+            self.status_label.setText("正在停止...")
             self.record_button.setEnabled(False)
             self.record_button.setText("正在停止...")
+            self.transcription_thread.stop_recording()
 
     def on_recording_finished(self):
         try:
@@ -760,12 +752,13 @@ class MainWindow(QMainWindow):
 
         self.record_button.setEnabled(True)
         self.record_button.setText("开始录音")
-        self.record_button.setStyleSheet(
-            self.record_button.styleSheet().replace("#B3261E", "#6750A4"))
+        self.record_button.setProperty("type", "primary")
         self.model_combo.setEnabled(True)
         self.language_combo.setEnabled(True)
         self.realtime_checkbox.setEnabled(True)
         self.config_button.setEnabled(True)
+        self.status_label.setText("准备就绪")
+        self.status_label.setProperty("status", "")
 
     def update_realtime_text(self, text):
         if text:
@@ -893,6 +886,23 @@ class MainWindow(QMainWindow):
             global BAIDU_APPID, BAIDU_KEY
             BAIDU_APPID = self.config['baidu_appid']
             BAIDU_KEY = self.config['baidu_key']
+
+    def update_status(self, status):
+        """更新状态显示"""
+        self.status_label.setText(status)
+        # 根据不同状态设置不同的属性
+        if "录音" in status:
+            self.status_label.setProperty("status", "recording")
+        elif "转录" in status:
+            self.status_label.setProperty("status", "transcribing")
+        elif "监听" in status:
+            self.status_label.setProperty("status", "listening")
+        else:
+            self.status_label.setProperty("status", "")
+
+        # 强制更新样式
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
 
     def async_log(self, content, add_furigana=False):
         """异步写入日志"""
